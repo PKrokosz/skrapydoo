@@ -74,7 +74,12 @@ def dismiss_overlays(driver, S):
                 S.Wait(driver, 2).until(S.EC.element_to_be_clickable(locator)).click(); wait(0.2)
             except Exception:
                 pass
-        driver.execute_script("const b=document.querySelectorAll('[role=\\"dialog\\"],[data-pagelet=\\"root\\"] [style*=\\"position: fixed\\"]');b.forEach(e=>e.style.display='none')")
+        driver.execute_script(
+            """
+const b=document.querySelectorAll('[role="dialog"],[data-pagelet="root"] [style*="position: fixed"]');
+b.forEach(e=>e.style.display='none');
+"""
+        )
     except Exception:
         pass
 
@@ -119,16 +124,19 @@ def to_mbasic_url(any_url: str) -> str:
     # derive tid
     existing_tid = parse_tid_from_url(any_url)
     if existing_tid:
-        tid = existing_tid
+        tid = build_tid(existing_tid)
     elif path.startswith('/messages/t/'):
         raw = path.split('/messages/t/',1)[1].split('/',1)[0]
         tid = build_tid(raw)
     else:
         # unknown form → pass through, try existing q['tid'] if present later
         tid = q.get('tid',[""])[0]
-    # rebuild query preserving all params except duplicate tid
-    q['tid'] = [tid] if tid else q.get('tid',[])
-    query = urlencode({k:v[0] for k,v in q.items() if v}, doseq=False)
+    # rebuild query preserving all params, allow repeated keys
+    if tid:
+        q['tid'] = [tid]
+    else:
+        q.pop('tid', None)
+    query = urlencode(q, doseq=True)
     return urlunparse(('https', netloc, '/messages/read/', '', query, ''))
 
 # -- Search helpers --
@@ -148,56 +156,69 @@ def find_thread_link_by_href_or_text(driver, S, query):
 def extract_messages_mbasic(html: str):
     soup = BeautifulSoup(html, "html.parser")
     root = soup.select_one("#messageGroup") or soup
-    msgs, seen, last_author = [], set(), None
+    msgs, seen = [], set()
+    last_author, last_ts = "", ""
     for block in root.select("div, p, span"):
         strong = block.find("strong")
-        if strong and strong.get_text(strip=True):
+        abbr = block.find("abbr")
+        if strong and not block.find("p") and not block.find("span"):
             last_author = strong.get_text(strip=True)
+            if abbr and (abbr.get("title") or abbr.get_text(strip=True)):
+                last_ts = abbr.get("title") or abbr.get_text(strip=True)
+            continue
         text_el = None
-        for sel in ["p","span[dir='auto']","div"]:
+        for sel in ["p", "span[dir='auto']", "div"]:
             t = block.select_one(sel)
             if t and t.get_text(strip=True):
-                text_el = t; break
-        if not text_el and block.name in ("p","span","div") and block.get_text(strip=True):
+                text_el = t
+                break
+        if not text_el and block.name in ("p", "span", "div") and block.get_text(strip=True):
             text_el = block
         if text_el:
             text = text_el.get_text(" ", strip=True)
-            if not text or text.lower() in ("wyświetl starsze wiadomości","pokaż starsze wiadomości","view older messages"):
+            if not text or text.lower() in (
+                "wyświetl starsze wiadomości",
+                "pokaż starsze wiadomości",
+                "view older messages",
+            ):
                 continue
-            ts = ""
-            abbr = block.find("abbr") or (block.parent.find("abbr") if block.parent else None)
-            if abbr and (abbr.get("title") or abbr.get_text(strip=True)):
-                ts = abbr.get("title") or abbr.get_text(strip=True)
-            key = (last_author or "", text, ts)
+            ts = last_ts
+            key = (last_author, text, ts)
             if key not in seen:
-                seen.add(key); msgs.append({"author": last_author or "", "text": text, "timestamp": ts})
+                seen.add(key)
+                msgs.append({"author": last_author, "text": text, "timestamp": ts})
     return msgs
 
 def extract_messages_m(html: str):
     soup = BeautifulSoup(html, "html.parser")
     root = soup.select_one("div[role='main']") or soup
-    msgs, seen, last_author = [], set(), None
+    msgs, seen = [], set()
+    last_author, last_ts = "", ""
     for c in root.select("div, p, span"):
         st = c.find("strong")
-        if st and st.get_text(strip=True):
+        abbr = c.find("abbr")
+        if st and not c.find("p") and not c.find("span"):
             last_author = st.get_text(strip=True)
+            if abbr and (abbr.get("title") or abbr.get_text(strip=True)):
+                last_ts = abbr.get("title") or abbr.get_text(strip=True)
+            continue
         text_el = None
-        for sel in ["p","div[dir='auto']","span[dir='auto']","._5w-5","._2_1w","._3oh-"]:
+        for sel in ["p", "div[dir='auto']", "span[dir='auto']", "._5w-5", "._2_1w", "._3oh-"]:
             t = c.select_one(sel)
             if t and t.get_text(strip=True):
-                text_el = t; break
-        if not text_el and c.name in ("p","span","div") and c.get_text(strip=True):
+                text_el = t
+                break
+        if not text_el and c.name in ("p", "span", "div") and c.get_text(strip=True):
             text_el = c
         if text_el:
             text = text_el.get_text(" ", strip=True)
-            if not text: continue
-            ts = ""
-            abbr = c.find("abbr")
-            if abbr and (abbr.get("title") or abbr.get_text(strip=True)):
-                ts = abbr.get("title") or abbr.get_text(strip=True)
-            key = (last_author or "", text, ts)
+            if not text:
+                continue
+            ts = last_ts
+            key = (last_author, text, ts)
             if key not in seen:
-                seen.add(key); msgs.append({"author": last_author or "", "text": text, "timestamp": ts})
+                seen.add(key)
+                msgs.append({"author": last_author, "text": text, "timestamp": ts})
     return msgs
 
 # -- Older buttons --
@@ -250,7 +271,8 @@ def login_and_get_driver_on_thread(S):
         exp_tid = parse_tid_from_url(mb_url)
         driver.get(mb_url); S.Wait(driver,10).until(S.EC.presence_of_element_located((S.By.TAG_NAME,"body"))); wait(1)
         got_tid = parse_tid_from_url(driver.current_url)
-        assert not exp_tid or exp_tid == got_tid, f"TID mismatch: expected {exp_tid}, got {got_tid}"
+        if exp_tid and exp_tid != got_tid:
+            raise RuntimeError(f"TID mismatch: expected {exp_tid}, got {got_tid}")
         return driver, "mbasic"
     driver.get("https://mbasic.facebook.com/messages/?q=" + quote(THREAD_QUERY)); S.Wait(driver,15).until(S.EC.presence_of_element_located((S.By.TAG_NAME,"body"))); wait(1)
     a = find_thread_link_by_href_or_text(driver, S, THREAD_QUERY)
@@ -333,6 +355,10 @@ def test_to_mbasic_url_transform_group_and_1to1_and_query():
     # already read/?tid stays same
     u3 = to_mbasic_url("https://m.facebook.com/messages/read/?tid=cid.c.42&foo=bar")
     assert u3.startswith("https://mbasic.facebook.com/messages/read/?") and 'tid=cid.c.42' in u3 and 'foo=bar' in u3
+    # multiple query params preserved
+    u4 = to_mbasic_url("https://www.facebook.com/messages/t/cid.g.123?foo=1&foo=2")
+    q4 = parse_qs(urlparse(u4).query)
+    assert q4['foo'] == ['1', '2']
 
 def test_parse_tid_from_url():
     assert parse_tid_from_url("https://mbasic.facebook.com/messages/read/?tid=cid.c.42") == "cid.c.42"
